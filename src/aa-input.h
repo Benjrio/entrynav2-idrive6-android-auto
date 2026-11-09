@@ -8,10 +8,11 @@
  * Rules:
  * - Only advertised keycodes are accepted. MENU is never one: it always belongs to iDrive.
  * - A key is "down" until its "up"; aa_input_release_all() (session end, cancel, later: HMI focus loss) sends "up"
- *   for every held key, so the phone never sees a stuck key. A stray "up" for a key that isn't held is dropped.
+ *   for every key whose "down" was sent. A stray "up" for a key that isn't held is dropped.
  * - Held longer than AA_LONGPRESS_US: one extra "down" with long_press=1 (once per press).
  * - Rotation accumulates and is sent in reports of at most +/-AA_ROTARY_MAX, so a fast spin can't overflow anything.
- * - A full key queue drops the new event (counted); a dropped "down" is never followed by its "up".
+ * - A full queue drops new presses (counted), but defers releases until after queued transitions.
+ *   A dropped "down" is never followed by its "up".
  * - Single thread: every function here runs on hu-aa's main loop (the input backend polls from that loop).
  *
  * Needs, defined before inclusion: struct AaPb, aa_v(), aa_sub(), aa_var(), aa_send(), aa_gen, aa_bound, now().
@@ -47,6 +48,9 @@ struct AaHeldKey { unsigned generation, code, long_sent, releasing; uint64_t sin
 static struct AaInputEvent aa_in_queue[AA_INPUT_SLOTS];
 static unsigned aa_in_write, aa_in_read;
 static struct AaHeldKey aa_in_held[AA_INPUT_HELD];
+/* Backend-held state can disappear as soon as UP is queued. Track successful sends separately so clearing
+ * the queue cannot lose an UP owed to the phone. Use one slot per advertised code, not per held-key slot. */
+static struct AaPhoneKey { unsigned generation, down, releasing; } aa_in_phone[AA_INPUT_KEYCOUNT];
 static int aa_in_rotary;
 static unsigned aa_in_rotary_gen;
 static unsigned aa_in_keys_sent, aa_in_rotary_sent, aa_in_dropped, aa_in_released, aa_in_longpress_sent;
@@ -54,6 +58,14 @@ static unsigned aa_in_keys_sent, aa_in_rotary_sent, aa_in_dropped, aa_in_release
 static int aa_input_supported(unsigned code) {
     for (unsigned i = 0; i < AA_INPUT_KEYCOUNT; i++) if (aa_input_keycodes[i] == code) return 1;
     return 0;
+}
+static struct AaPhoneKey *aa_input_phone(unsigned code) {
+    for (unsigned i = 0; i < AA_INPUT_KEYCOUNT; i++) if (aa_input_keycodes[i] == code) {
+        struct AaPhoneKey *k = &aa_in_phone[i];
+        if (k->generation != aa_gen) *k = (struct AaPhoneKey){ aa_gen, 0, 0 };
+        return k;
+    }
+    return NULL;
 }
 static void aa_input_advertise(struct AaPb *codes) {
     for (unsigned i = 0; i < AA_INPUT_KEYCOUNT; i++) aa_var(codes, aa_input_keycodes[i]);
@@ -82,9 +94,12 @@ static int aa_key(unsigned code, int down, int longpress) {
         printf("AA_INPUT_REJECT generation=%u key=%u reason=not-advertised\n", aa_gen, code); return 0;
     }
     uint64_t us = now() / 1000; struct AaHeldKey *held = aa_input_held(code);
+    struct AaPhoneKey *phone = aa_input_phone(code);
+    /* Do not queue a fresh DOWN or long press while an earlier UP still needs recovery. */
+    if (down && phone->releasing) return 0;
     if (!down) {
         if (!held || held->releasing) return 0;           /* stray up: never pressed (or already releasing) */
-        if (!aa_input_enqueue(code, 0, 0, us)) { held->releasing = 1; return 0; }  /* pump will release it */
+        if (!aa_input_enqueue(code, 0, 0, us)) { held->releasing = phone->releasing = 1; return 0; }
         memset(held, 0, sizeof *held);
         return 1;
     }
@@ -109,11 +124,18 @@ static void aa_rotary(int delta) {
     if (sum < -AA_ROTARY_LIMIT) sum = -AA_ROTARY_LIMIT;
     aa_in_rotary = (int)sum;
 }
-/* Drop queued input and release every held key at the next pump. */
+/* Drop queued input and release every successfully sent press at the next pump. */
 static void aa_input_release_all(const char *reason) {
     unsigned held = 0;
-    for (unsigned i = 0; i < AA_INPUT_HELD; i++)
-        if (aa_in_held[i].code && aa_in_held[i].generation == aa_gen) { aa_in_held[i].releasing = 1; held++; }
+    for (unsigned i = 0; i < AA_INPUT_KEYCOUNT; i++) {
+        struct AaPhoneKey *k = &aa_in_phone[i];
+        if (k->generation != aa_gen) continue;
+        /* A queued UP may have already cleared aa_in_held. Only the sent state can tell whether the phone
+         * still needs it. Conversely, a discarded, unsent DOWN must not produce a stray UP. */
+        k->releasing = k->down;
+        held += k->down;
+    }
+    memset(aa_in_held, 0, sizeof aa_in_held);
     aa_in_read = aa_in_write; aa_in_rotary = 0;
     printf("AA_INPUT_RELEASE_ALL generation=%u reason=%s held=%u\n", aa_gen, reason, held);
 }
@@ -123,6 +145,7 @@ static int aa_input_send_key(unsigned code, unsigned down, unsigned longpress, u
     aa_v(&event, 1, code); aa_v(&event, 2, down); aa_v(&event, 3, 0); aa_v(&event, 4, longpress);
     aa_sub(&list, 1, &event); aa_v(&message, 1, us); aa_sub(&message, 4, &list);
     if (!aa_send(1, 0x8001, message.b, message.n, 1, 0)) return 0;
+    aa_input_phone(code)->down = down; /* Failed sends must not change the phone's tracked state. */
     aa_in_keys_sent++; if (longpress && down) aa_in_longpress_sent++;
     printf("AA_INPUT generation=%u key=%u down=%u longpress=%u timestamp_us=%llu\n", aa_gen, code, down, longpress, (unsigned long long)us);
     return 1;
@@ -144,19 +167,28 @@ static int aa_input_pump(void) {
         if (stale || aa_in_rotary) printf("AA_INPUT_DISCARD generation=%u queued=%u rotary=%d reason=not-bound\n", aa_gen, stale, aa_in_rotary);
         aa_in_read = aa_in_write; aa_in_rotary = 0;
         for (unsigned i = 0; i < AA_INPUT_HELD; i++) if (aa_in_held[i].generation == aa_gen) memset(&aa_in_held[i], 0, sizeof aa_in_held[i]);
+        memset(aa_in_phone, 0, sizeof aa_in_phone);
         return 1;
     }
     uint64_t us = now() / 1000;
-    for (unsigned i = 0; i < AA_INPUT_HELD; i++) {           /* releases first: never leave a key down */
-        struct AaHeldKey *k = &aa_in_held[i];
-        if (!k->code || k->generation != aa_gen || !k->releasing) continue;
-        if (!aa_input_send_key(k->code, 0, 0, us)) return 0;
-        aa_in_released++; memset(k, 0, sizeof *k);
-    }
     while (aa_in_read != aa_in_write) {
         struct AaInputEvent e = aa_in_queue[aa_in_read % AA_INPUT_SLOTS];
         if (e.generation == aa_gen && !aa_input_send_key(e.code, e.down, e.longpress, e.us)) return 0;
         aa_in_read++;
+    }
+    /* Recover overflowed UPs after queued transitions: sending them first could produce UP then DOWN,
+     * leaving the phone stuck. Keep recovery pending on send failure, including after release_all(). */
+    for (unsigned i = 0; i < AA_INPUT_KEYCOUNT; i++) {
+        struct AaPhoneKey *k = &aa_in_phone[i];
+        if (k->generation != aa_gen || !k->releasing) continue;
+        unsigned code = aa_input_keycodes[i];
+        if (k->down) {
+            if (!aa_input_send_key(code, 0, 0, us)) return 0;
+            aa_in_released++;
+        }
+        k->releasing = 0;
+        struct AaHeldKey *held = aa_input_held(code);
+        if (held && held->releasing) memset(held, 0, sizeof *held);
     }
     if (aa_in_rotary_gen != aa_gen) { aa_in_rotary = 0; aa_in_rotary_gen = aa_gen; }
     while (aa_in_rotary) {

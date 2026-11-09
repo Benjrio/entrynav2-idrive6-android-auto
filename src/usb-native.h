@@ -79,13 +79,13 @@ static void usb_close(void){
 }
 static int accessory(unsigned v,unsigned p){return usb_aoa_ids(v,p);}
 /* Enumeration picked by the port/any policies (usb_select_discovered); open must find exactly that device. */
-static unsigned usb_sel_vid,usb_sel_pid,usb_sel_dev;static int usb_sel_valid;
+static unsigned usb_sel_vid,usb_sel_pid,usb_sel_dev,usb_sel_bus;static int usb_sel_valid;
 static int usb_open_port(int reenum){
  if(cancelled)return usb_failure("open",-1,ECANCELED,"cancel-before-open");
  unsigned vid=read_number(usb_port,"idVendor",16),pid=read_number(usb_port,"idProduct",16);
  unsigned bus=read_number(usb_port,"busnum",10),dev=read_number(usb_port,"devnum",10);
  int identity=reenum?accessory(vid,pid):accessory(vid,pid)||
-  (usb_policy_discovers()?usb_sel_valid&&vid==usb_sel_vid&&pid==usb_sel_pid&&dev==usb_sel_dev:usb_phone_matches(vid,pid));
+  (usb_policy_discovers()?usb_sel_valid&&vid==usb_sel_vid&&pid==usb_sel_pid&&dev==usb_sel_dev&&bus==usb_sel_bus:usb_phone_matches(vid,pid));
  if(!identity)return usb_failure("device-selection",-1,ENODEV,"identity-mismatch-or-absent");
  if(read_number(usb_port,"bDeviceClass",16)==9)return usb_failure("device-selection",-1,EPERM,"hub-rejected");
  if(!bus||!dev||(reenum&&(bus!=usb_bus||dev==usb_dev)))return usb_failure("enumeration",-1,ENODEV,"bus-or-fresh-devnum");
@@ -112,9 +112,13 @@ static int usb_select_discovered(const char *only_port){
  else n=usb_disc_scan(list,USB_DISC_MAX,t,&picked,&settling);
  for(unsigned i=0;i<n;i++){usb_disc_log(USB_EVENT_SOURCE,&list[i]);if(list[i].eligible||list[i].accessory)one=&list[i];}
  printf("USB_SELECTION source=%s policy=%s candidates=%u settling=%u ambiguity_write_attempted=0\n",USB_EVENT_SOURCE,usb_policy_name(),picked,settling);
+ if(picked&&settling)return usb_failure("device-selection",0,ENODEV,"wait-for-complete-selection");
  if(picked>1)return usb_failure("device-selection",0,EBUSY,"ambiguous");
+ if(picked==1){struct usb_cand verify;
+  if(!one || !usb_disc_eval(one->port,&verify,now()) || verify.bus!=one->bus || verify.dev!=one->dev || verify.vid!=one->vid || verify.pid!=one->pid)
+   return usb_failure("device-selection",0,ENODEV,"snapshot-changed");}
  if(!picked)return usb_failure("device-selection",0,ENODEV,settling?"settling":"no-device");
- strcpy(usb_port,one->port);usb_sel_vid=one->vid;usb_sel_pid=one->pid;usb_sel_dev=one->dev;usb_sel_valid=1;
+ strcpy(usb_port,one->port);usb_sel_vid=one->vid;usb_sel_pid=one->pid;usb_sel_dev=one->dev;usb_sel_bus=one->bus;usb_sel_valid=1;
  return 1;
 }
 static int usb_select(const char *explicit_port){

@@ -19,12 +19,12 @@ static void aa_var(struct AaPb *p, uint64_t v) { do { require(p->n < sizeof(p->b
 static void aa_v(struct AaPb *p, unsigned field, uint64_t v) { aa_var(p, (uint64_t)field * 8); aa_var(p, v); }
 static void aa_b(struct AaPb *p, unsigned field, const uint8_t *b, unsigned n) { aa_var(p, (uint64_t)field * 8 + 2); aa_var(p, n); memcpy(p->b + p->n, b, n); p->n += n; }
 static void aa_sub(struct AaPb *p, unsigned field, struct AaPb *s) { aa_b(p, field, s->b, s->n); }
-#define MAXSENT 64
+#define MAXSENT 128
 static struct { unsigned channel, id, n; uint8_t b[256]; } sent[MAXSENT];
-static unsigned nsent; static int send_ok = 1;
+static unsigned nsent, send_fail_after = MAXSENT; static int send_ok = 1;
 static int aa_send(unsigned channel, unsigned id, const uint8_t *body, unsigned n, int encrypted, int control) {
     (void)encrypted; (void)control;
-    if (!send_ok) return 0;
+    if (!send_ok || nsent == send_fail_after) return 0;
     require(nsent < MAXSENT && n <= sizeof sent[0].b, "test capture bound");
     sent[nsent].channel = channel; sent[nsent].id = id; sent[nsent].n = n; memcpy(sent[nsent].b, body, n); nsent++;
     return 1;
@@ -67,7 +67,7 @@ static int decode(unsigned idx, struct Decoded *d) {
     return events == 1;
 }
 static void reset(void) {
-    nsent = 0; send_ok = 1; aa_bound = 1; aa_gen++;
+    nsent = 0; send_ok = 1; send_fail_after = MAXSENT; aa_bound = 1; aa_gen++;
     aa_in_read = aa_in_write; aa_in_rotary = 0;
     aa_in_keys_sent = aa_in_rotary_sent = aa_in_dropped = aa_in_released = aa_in_longpress_sent = 0;
 }
@@ -127,8 +127,8 @@ static void test_rules(void) {
     aa_rotary(5); aa_key(AA_KEY_DPAD_UP, 1, 0); aa_input_release_all("test");
     aa_input_pump();
     int ups = 0; for (unsigned i = 0; i < nsent; i++) { struct Decoded x; if (decode(i, &x) && x.kind == 4 && !x.down) ups++; }
-    CHECK(ups == 3 && nsent == 3 && aa_in_rotary == 0, "release-all sends up for every held key and drops queued input (%u sent, %d ups)", nsent, ups);
-    aa_input_pump(); CHECK(nsent == 3, "nothing more after release-all");
+    CHECK(ups == 2 && nsent == 2 && aa_in_rotary == 0, "release-all releases sent presses and drops unsent input (%u sent, %d ups)", nsent, ups);
+    aa_input_pump(); CHECK(nsent == 2, "nothing more after release-all");
 
     reset(); aa_bound = 0; aa_key(AA_KEY_DPAD_CENTER, 1, 0); aa_rotary(2); aa_input_pump();
     CHECK(nsent == 0 && !aa_input_held(AA_KEY_DPAD_CENTER), "not bound: discarded, nothing held");
@@ -162,8 +162,63 @@ static void test_provisional_ccu(void) {
     CHECK(ok && key_report(0, AA_KEY_DPAD_CENTER, 1, 0) && key_report(1, AA_KEY_DPAD_CENTER, 0, 0), "provisional CCUFrontEvent mapping (keys first, then rotation)");
 }
 
+/* An odd number of transitions leaves CENTER down and fills the queue behind BACK. */
+static void fill_after_back(void) {
+    for (unsigned i = 0; i < AA_INPUT_SLOTS - 1; i++) aa_key(AA_KEY_DPAD_CENTER, !(i % 2), 0);
+}
+
+static void test_overflow_release(void) {
+    reset(); aa_key(AA_KEY_BACK, 1, 0); fill_after_back();
+    CHECK(!aa_key(AA_KEY_BACK, 0, 0) && !aa_key(AA_KEY_DPAD_CENTER, 0, 0), "two releases overflow a full queue");
+    CHECK(!aa_key(AA_KEY_BACK, 1, 0) && !aa_key(AA_KEY_BACK, 1, 1), "pending release blocks repeat and long press");
+    fake_ns += 1000000000ULL;
+    CHECK(aa_input_pump() && nsent == 66, "64 queued transitions precede two fallback releases");
+    CHECK(key_report(0, AA_KEY_BACK, 1, 0) && key_report(64, AA_KEY_BACK, 0, 0) &&
+          key_report(65, AA_KEY_DPAD_CENTER, 0, 0), "overflow releases follow their pending presses");
+    aa_input_pump(); CHECK(nsent == 66, "no duplicate release or synthetic long press after overflow");
+    CHECK(aa_key(AA_KEY_BACK, 1, 0) && aa_key(AA_KEY_BACK, 0, 0) && aa_input_pump() && nsent == 68,
+          "new press works after overflow recovery");
+
+    reset(); aa_key(AA_KEY_BACK, 1, 0); fill_after_back(); aa_key(AA_KEY_BACK, 0, 0);
+    send_fail_after = AA_INPUT_SLOTS;
+    CHECK(!aa_input_pump() && nsent == 64, "failure sending fallback release is reported");
+    send_fail_after = MAXSENT;
+    CHECK(aa_input_pump() && nsent == 65 && key_report(64, AA_KEY_BACK, 0, 0), "retry preserves the required fallback release");
+}
+
+static void test_release_all_delivery(void) {
+    reset(); aa_key(AA_KEY_BACK, 1, 0); aa_input_pump(); aa_key(AA_KEY_BACK, 0, 0);
+    aa_input_release_all("queued-up"); aa_input_release_all("repeated"); aa_input_pump();
+    CHECK(nsent == 2 && key_report(1, AA_KEY_BACK, 0, 0), "release-all preserves an up for a press already sent");
+    aa_input_release_all("already-released"); aa_input_pump();
+    CHECK(nsent == 2, "release-all is idempotent");
+
+    reset(); aa_key(AA_KEY_BACK, 1, 0); aa_key(AA_KEY_BACK, 0, 0); aa_rotary(3);
+    aa_input_release_all("unsent"); aa_input_pump();
+    CHECK(nsent == 0, "discarding an unsent press sends neither down nor stray up");
+
+    reset(); aa_key(AA_KEY_BACK, 1, 0); aa_input_pump(); aa_key(AA_KEY_BACK, 0, 0);
+    aa_input_release_all("retry"); send_ok = 0;
+    CHECK(!aa_input_pump() && nsent == 1, "release-all reports a send failure");
+    CHECK(!aa_key(AA_KEY_BACK, 1, 1), "failed release blocks a new press");
+    aa_input_release_all("retry-again"); send_ok = 1;
+    CHECK(aa_input_pump() && nsent == 2 && key_report(1, AA_KEY_BACK, 0, 0), "failed release remains pending");
+    aa_input_pump(); CHECK(nsent == 2, "successful retry sends exactly one release");
+
+    reset(); aa_key(AA_KEY_BACK, 1, 0); aa_input_pump(); aa_input_release_all("old-session");
+    aa_gen++; aa_input_pump(); aa_input_release_all("new-session"); aa_input_pump();
+    CHECK(nsent == 1, "new session does not send releases for the old phone session");
+    CHECK(aa_key(AA_KEY_BACK, 1, 0) && aa_input_pump() && nsent == 2 && key_report(1, AA_KEY_BACK, 1, 0),
+          "old pending release does not block a new session");
+
+    reset(); aa_key(AA_KEY_BACK, 1, 0); send_ok = 0; aa_input_pump();
+    aa_input_release_all("failed-down"); send_ok = 1; aa_input_pump();
+    CHECK(nsent == 0, "a failed down does not create phone-held state");
+}
+
 int main(void) {
     test_advertise(); test_exact_bytes(); test_rules(); test_provisional_ccu();
+    test_overflow_release(); test_release_all_delivery();
     printf("%s: %d checks, %d failures\n", failures ? "FAILED" : "OK", checks, failures);
     return failures ? 1 : 0;
 }

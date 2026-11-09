@@ -2,9 +2,10 @@
  * opens a /dev/bus/usb node and never sends a USB request. Rules:
  *   R1 device names only (no root hubs/interfaces)   R2 port policy        R3 no hubs        R4 no Apple
  *   R5 settled: configured, interfaces present, devnum unchanged for USB_SETTLE_NS
- *   R6 no storage/HID/printer/smart-card/video/Bluetooth interface, no kernel driver except tethering ones
+ *   R6 no HID/printer/smart-card/video/Bluetooth; storage requires a separate positive Android interface
  *   R7 an Android signal: MTP/PTP, vendor-specific (ADB, MTP), RNDIS/ECM/NCM tethering
- *   R8 not an enumeration that already failed AOA GET_PROTOCOL       R9 no interface claimed by another process
+ *   R8 not an enumeration that already failed AOA GET_PROTOCOL
+ * Ordinary usbfs/storage bindings permit control-only negotiation, never detach/claim before AOA.
  * A device already in AOA accessory mode (18d1:2d00/2d01) on an allowed port is accepted as is.
  */
 #pragma once
@@ -92,15 +93,24 @@ static int usb_disc_eval(const char *name, struct usb_cand *c, uint64_t t) {
 
     char cfg[16]; usb_sysfs_text(name, "bConfigurationValue", cfg, sizeof cfg);
     uint64_t since = usb_seen_since(name, c->bus, c->dev, t);
-    if (!*cfg) { c->settling = 1; return usb_disc_reject(c, "settling:unconfigured"); }               /* R5 */
+    if (!*cfg || strspn(cfg, "0123456789") != strlen(cfg) || !strtoul(cfg,NULL,10)) {
+        c->settling = 1; return usb_disc_reject(c, "settling:unconfigured");
+    }
 
     DIR *d = opendir(usb_sysfs_root);
     if (!d) return usb_disc_reject(c, "sysfs-unreadable");
-    size_t nl = strlen(name); int signal = 0, blocked = 0; struct dirent *e; size_t used = 0;
-    while ((e = readdir(d)) && c->ifaces < USB_DISC_MAX_IFACES) {
+    size_t nl = strlen(name); int signal = 0, android = 0, storage = 0, blocked = 0; struct dirent *e; size_t used = 0;
+    while ((e = readdir(d))) {
         if (strncmp(e->d_name, name, nl) || e->d_name[nl] != ':') continue;
         if (strchr(e->d_name + nl + 1, ':')) continue;
+        if (c->ifaces == USB_DISC_MAX_IFACES) { usb_disc_reject(c,"too-many-interfaces"); blocked=1; break; }
         c->ifaces++;
+        char attr[40];
+        const char *required[]={"bInterfaceClass","bInterfaceSubClass","bInterfaceProtocol"};
+        for(unsigned k=0;k<3;k++) if(!usb_sysfs_text(e->d_name,required[k],attr,sizeof attr) ||
+            strlen(attr)!=2 || strspn(attr,"0123456789abcdefABCDEF")!=2) {
+            usb_disc_reject(c,"incomplete-interface");blocked=1;
+        }
         unsigned cls = usb_sysfs_num(e->d_name, "bInterfaceClass", 16), sub = usb_sysfs_num(e->d_name, "bInterfaceSubClass", 16),
                  proto = usb_sysfs_num(e->d_name, "bInterfaceProtocol", 16);
         char drv[64], iname[64]; usb_sysfs_driver(e->d_name, drv, sizeof drv); usb_sysfs_text(e->d_name, "interface", iname, sizeof iname);
@@ -109,23 +119,32 @@ static int usb_disc_eval(const char *name, struct usb_cand *c, uint64_t t) {
             if (w > 0) used += (size_t)w;
         }
         if (blocked) continue;
-        const char *deny = cls == 0x08 ? "storage" : cls == 0x03 ? "hid" : cls == 0x07 ? "printer" : cls == 0x0b ? "smart-card"
+        if(cls==0x08)storage=1;
+        if(cls==0x06 || (cls==0xff && sub==0x42 && proto==1) || strstr(iname,"MTP") || strstr(iname,"Android"))android=1;
+        const char *deny = cls == 0x03 ? "hid" : cls == 0x07 ? "printer" : cls == 0x0b ? "smart-card"
                          : cls == 0x0e ? "video" : cls == 0x09 ? "hub" : (cls == 0xe0 && sub == 0x01 && proto == 0x01) ? "bluetooth" : NULL;
         if (deny) { usb_disc_reject(c, deny); blocked = 1; continue; }                                  /* R6 */
         if (*drv) {
-            if (!strcmp(drv, "usbfs")) { usb_disc_reject(c, "claimed-by-userspace"); blocked = 1; continue; } /* R9 */
-            if (strcmp(drv, "rndis_host") && strcmp(drv, "cdc_ether") && strcmp(drv, "cdc_ncm")) {
+            /* Control-only AOA probe does not claim/detach ordinary phone interfaces.
+             * usbfs and an extra storage interface are common Android composites.
+             * Storage without a positive Android interface is rejected below. */
+            if (strcmp(drv, "usbfs") && strcmp(drv,"usb-storage") && strcmp(drv, "rndis_host") && strcmp(drv, "cdc_ether") && strcmp(drv, "cdc_ncm")) {
                 char why[64]; snprintf(why, sizeof why, "driver:%s", drv); usb_disc_reject(c, why); blocked = 1; continue; /* R6 */
             }
         }
-        if (cls == 0x06 || cls == 0xff || (cls == 0xe0 && sub == 0x01 && proto == 0x03) || (cls == 0xef && sub == 0x04 && proto == 0x01) ||
+        /* ff/ff/ff without an Android interface name is an undefined vendor
+         * protocol (also used by internal HU bridges), not evidence of a phone. */
+        if (android || cls == 0x06 || (cls == 0xff && proto != 0xff) || (cls == 0xe0 && sub == 0x01 && proto == 0x03) || (cls == 0xef && sub == 0x04 && proto == 0x01) ||
             (cls == 0x02 && (sub == 0x06 || sub == 0x0d)) || (cls == 0x0a && *drv)) signal = 1;           /* R7 */
     }
     closedir(d);
     if (blocked) return 0;
+    if(storage && !android)return usb_disc_reject(c,"storage-without-android-interface");
     if (!c->ifaces) { c->settling = 1; return usb_disc_reject(c, "settling:no-interfaces"); }           /* R5 */
     if (t - since < USB_SETTLE_NS) { c->settling = 1; return usb_disc_reject(c, "settling:new"); }       /* R5 */
     if (!signal) return usb_disc_reject(c, "no-android-signal");                                       /* R7 */
+    if(c->ifaces!=usb_sysfs_num(name,"bNumInterfaces",10))return usb_disc_reject(c,"incomplete-interface-count");
+    if(c->bus!=usb_sysfs_num(name,"busnum",10) || c->dev!=usb_sysfs_num(name,"devnum",10))return usb_disc_reject(c,"enumeration-changed");
     if (usb_disc_is_not_aoa(name, c->bus, c->dev)) return usb_disc_reject(c, "not-aoa-remembered");    /* R8 */
     c->eligible = 1; snprintf(c->reason, sizeof c->reason, "eligible");
     return 1;
@@ -137,8 +156,9 @@ static unsigned usb_disc_scan(struct usb_cand *out, unsigned max, uint64_t t, un
     *picked = *settling = 0;
     DIR *d = opendir(usb_sysfs_root); if (!d) return 0;
     struct dirent *e; unsigned n = 0;
-    while ((e = readdir(d)) && n < max) {
+    while ((e = readdir(d))) {
         if (e->d_name[0] == '.' || strchr(e->d_name, ':') || !strncmp(e->d_name, "usb", 3)) continue;
+        if(n==max){*picked=0;*settling=1;closedir(d);return 0;}
         if (usb_disc_eval(e->d_name, &out[n], t)) (*picked)++;
         else if (out[n].settling) (*settling)++;
         n++;

@@ -51,6 +51,7 @@ static int usb_phone_config(void) {
     int fd = open("usb-device.conf", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return 0;
     struct stat st; char b[520] = {0};
+    /* The bound includes comments: an oversized example config would prevent startup before parsing "any". */
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 1 || st.st_size > 512) { close(fd); return 0; }
     ssize_t n = read(fd, b, sizeof(b) - 1); close(fd);
     if (n != st.st_size || memchr(b, 0, (size_t)n)) return 0;

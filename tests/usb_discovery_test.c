@@ -74,6 +74,20 @@ static void test_parser(void) {
     CHECK(!conf("\n# only comments\n"), "no directive");
     char big[600]; memset(big, '#', sizeof big - 2); big[sizeof big - 2] = '\n'; big[sizeof big - 1] = 0;
     CHECK(!conf(big), "over 512 bytes");
+    char boundary[514]; memset(boundary, '#', sizeof boundary);
+    memcpy(boundary, "any\n#", 5); boundary[512] = 0;
+    CHECK(conf(boundary) && usb_policy == USB_POLICY_ANY, "exactly 512 bytes including comments is accepted");
+    boundary[512] = '#'; boundary[513] = 0;
+    CHECK(!conf(boundary), "513 bytes including comments is rejected");
+}
+
+static void test_shipped_config(const char *path) {
+    char b[1024]; FILE *f = fopen(path, "r");
+    CHECK(f != NULL, "shipped configuration is readable");
+    if (!f) return;
+    size_t n = fread(b, 1, sizeof b - 1, f); int ok = !ferror(f) && feof(f); fclose(f); b[n] = 0;
+    CHECK(ok && n <= 512 && conf(b) && usb_policy == USB_POLICY_ANY,
+          "shipped configuration fits the parser and selects any (%zu bytes)", n);
 }
 
 static void test_filter(void) {
@@ -143,12 +157,13 @@ static void test_ambiguous(void) {
     CHECK(picked == 2, "two phones are both candidates (the caller then refuses): %u", picked);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc != 2) { fprintf(stderr, "usage: %s /absolute/path/to/runtime/aa/usb-device.conf\n", argv[0]); return 64; }
     snprintf(root, sizeof root, "/tmp/usb-discovery-test-%d/sys", (int)getpid());
     char work[300]; snprintf(work, sizeof work, "/tmp/usb-discovery-test-%d", (int)getpid());
     mkdir(work, 0700); if (chdir(work)) return 1;
     usb_sysfs_root = root;
-    test_parser(); test_filter(); test_port_policy(); test_ambiguous();
+    test_parser(); test_shipped_config(argv[1]); test_filter(); test_port_policy(); test_ambiguous();
     char cmd[350]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", work); if (system(cmd)) {}
     printf("%s: %d checks, %d failures\n", failures ? "FAILED" : "OK", checks, failures);
     return failures ? 1 : 0;

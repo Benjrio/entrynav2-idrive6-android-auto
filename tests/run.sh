@@ -12,7 +12,8 @@ for test in usb_discovery_test aa_input_test vmost_listen_test; do
     # shellcheck disable=SC2086
     $cc $flags -pthread -o "$out/$test" "$here/$test.c" -ldl
     arg=; [ "$test" = vmost_listen_test ] && arg=$out/libfakevmostclient.so
-    "$out/$test" $arg > "$out/$test.log" 2>&1 || status=1
+    [ "$test" = usb_discovery_test ] && arg=$here/../runtime/aa/usb-device.conf
+    "$out/$test" ${arg:+"$arg"} > "$out/$test.log" 2>&1 || status=1
     if [ "${VERBOSE:-0}" = 1 ]; then cat "$out/$test.log"; fi
     printf '%-20s %s\n' "$test" "$(grep -E '^(OK|FAILED):' "$out/$test.log" || echo 'no summary (crashed?)')"
     grep -E '^FAIL |runtime error|ERROR: AddressSanitizer|ThreadSanitizer' "$out/$test.log" || :

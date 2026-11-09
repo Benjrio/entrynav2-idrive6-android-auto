@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
     }
     const char *port = NULL;
     for (unsigned i = 0; i < n; i++) if (list[i].eligible || list[i].accessory) port = list[i].port;
+    if(picked && settling){puts("RESULT waiting_for_complete_selection (no AOA request sent)");return 1;}
     if (picked == 1) printf("RESULT would_select=%s (no AOA request sent by this tool)\n", port);
     else if (picked > 1) printf("RESULT ambiguous candidates=%u: hu-aa.elf sends nothing; unplug one or use 'port <path>'\n", picked);
     else printf("RESULT none%s\n", settling ? " (some devices still settling; run again)" : "");
