@@ -76,43 +76,51 @@ A normal restart is required after installation on the head unit.
 
 ### Configuring your phone before building
 
-`runtime/aa/usb-device.conf` contains the placeholder `USB_PORT VID PID`.
-It deliberately fails validation: the USB session cannot start until it is
-filled in. Replace it with one line containing three space-separated values:
+`runtime/aa/usb-device.conf` holds one directive (`#` starts a comment). It is
+copied to `build/aa/usb-device.conf` and, on install, into the immutable runtime,
+so choose before the first install. The default is `any`.
 
-```text
-<USB-port> <VID-4-hex> <PID-4-hex>
-```
+| Directive | Selects |
+|---|---|
+| `any` | any Android Auto phone on any USB port, if exactly one candidate is plugged in |
+| `port 1-1 [2-1 ...]` | any Android Auto phone, only on these ports (up to 4 head unit sysfs paths) |
+| `<USB-port> <VID> <PID>` | one specific phone on one port (original format, unchanged) |
+| `auto` | only a device already in AOA accessory mode, `18d1:2d00`/`2d01` (original format) |
 
-Do not include the angle brackets. USB-port is the device name in the head
-unit's sysfs: numbers separated by a hyphen and, when a hub is present, dots.
-VID and PID must each contain exactly four hexadecimal digits without `0x`.
-Use the phone's identifiers **before it enters AOA accessory mode**, in the USB
-mode in which it will connect to the head unit. VID/PID may change when the USB
-mode changes.
+`any` and `port` find the phone without a fixed VID/PID, in three steps:
 
-Read the values from `/sys/bus/usb/devices/<USB-port>/idVendor` and `idProduct`
-on the target head unit. Identify the port by observing which device appears
-when the phone is connected; the USB port on your computer does not determine
-the head unit's USB topology. These files can be read manually without
-performing AOA negotiation or changing USB settings.
-The phone's serial number is not needed. Then run `build.py`: the configuration
-will be copied to `build/aa/usb-device.conf`. There is no need to change VID/PID
-in the code; the parser and filter are in `src/usb_selection.h`.
+1. **Sysfs-only filter** (`src/usb_discovery.h`). Attribute files are read; no
+   device node is opened and no request is sent. Rejected: hubs, Apple devices,
+   devices with a storage, HID, printer, smart-card, video or Bluetooth interface,
+   devices with any kernel driver bound except tethering (`rndis_host`,
+   `cdc_ether`, `cdc_ncm`), interfaces another process holds through usbfs, and
+   devices with no Android-like interface (MTP/PTP, vendor-specific such as ADB,
+   tethering). A device must also be configured and unchanged for 1.5 s.
+2. **One device or nothing.** With two or more candidates, nothing is sent to any
+   of them (`ambiguous`); unplug one or use `port`.
+3. **One AOA question.** Only that device gets `GET_PROTOCOL`. A device that
+   refuses is remembered for that enumeration and never asked again (a replug
+   clears it); at most 3 per run. Then the existing strings, `START` and
+   re-enumeration checks on the same port.
 
-The value `auto` is also supported, but selects only a device **already in
-standard AOA accessory mode** (`18d1:2d00` / `18d1:2d01`). It does not discover
-arbitrary Android devices in their normal USB mode. Selection is rejected if
-multiple devices match. These standard AOA IDs in `src/usb-native.h` identify
-the protocol, not a phone model.
+Every decision is logged as `USB_CANDIDATE ... verdict=...` and
+`USB_AOA_PROBE ... result=...` in `android-auto.log`. To see what would be picked
+without sending anything, run on the head unit
+`sh run-hu.sh usb-scan /tmp/ownandroidauto-kit-usb-01 [seconds]`
+(`aa/usb-scan.elf`; exit 0 = one device, 1 = none, 2 = ambiguous).
+The original `<USB-port> <VID> <PID>` line still works as before: USB-port is the
+head unit's sysfs device name (`1-1`, `1-1.2`), VID/PID are four hex digits each
+as the phone shows them **before** AOA accessory mode. Host tests:
+`sh tests/run.sh` (Linux/WSL).
 
 ### Work needed for general device support
 
-- Add discovery of AOA-capable phones in normal USB mode without a fixed VID/PID,
-  with controlled AOA protocol checks and physical port selection. Do not send
-  AOA requests indiscriminately to every USB device.
-- Define behavior for multiple phones and changes in USB topology while
-  retaining rejection of ambiguous device claims.
+- Validate the `any`/`port` filter on the car: phones in charge-only, MTP and PTP
+  modes; whether the stock media software holds MTP phones through usbfs (then
+  they are rejected as `claimed-by-userspace` and that rule needs a decision);
+  the head unit's own internal USB devices.
+- Define behavior for changes in USB topology while retaining rejection of
+  ambiguous device claims.
 - Validate entry into accessory mode, re-enumeration, disconnection, interface
   release, and subsequent sessions across different phones and AA versions.
 - Check AA version negotiation compatibility: `src/aa-phone-version.h` retains
