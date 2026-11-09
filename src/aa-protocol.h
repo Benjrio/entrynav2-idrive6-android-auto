@@ -37,9 +37,6 @@ static char aa_reason[64];
 struct AaPcm {unsigned generation;uint64_t first;int16_t samples[PCM_FRAMES*2];};
 static struct AaPcm aa_pcm[AA_PCM_SLOTS];
 static volatile unsigned aa_pcm_write,aa_pcm_read;
-struct AaKey {unsigned generation,key;int action;uint64_t us;};
-static struct AaKey aa_keys[64];
-static volatile unsigned aa_key_write,aa_key_read;
 static volatile unsigned aa_focus_request,aa_focus_sent;
 static unsigned aa_live(void){return aa_run&&aa_ram[10]&&aa_ram[8]==aa_gen&&aa_requested_disconnect!=aa_gen;}
 static int aa_error(const char *reason){snprintf(aa_reason,sizeof(aa_reason),"%s",reason);return 0;}
@@ -64,6 +61,7 @@ static void aa_var(struct AaPb *p,uint64_t v){do{require(p->n<sizeof(p->b),"AA p
 static void aa_v(struct AaPb *p,unsigned field,uint64_t v){aa_var(p,(uint64_t)field*8);aa_var(p,v);}
 static void aa_b(struct AaPb *p,unsigned field,const uint8_t *b,unsigned n){aa_var(p,(uint64_t)field*8+2);aa_var(p,n);require(p->n+n<=sizeof(p->b),"AA protobuf bytes bound");memcpy(p->b+p->n,b,n);p->n+=n;}
 static void aa_sub(struct AaPb *p,unsigned field,struct AaPb *s){aa_b(p,field,s->b,s->n);}
+#include "aa-input.h"
 static int aa_getvar(const uint8_t *p,unsigned n,unsigned *i,uint64_t *v){
  *v=0;for(unsigned shift=0;shift<70;shift+=7){if(*i>=n)return 0;unsigned b=p[(*i)++];if(shift==63&&b>1)return 0;*v|=(uint64_t)(b&127)<<shift;if(!(b&128))return 1;}return 0;
 }
@@ -118,10 +116,10 @@ static int aa_service(void){
  channel.n=av.n=config.n=0;
  aa_v(&config,1,PCM_RATE);aa_v(&config,2,16);aa_v(&config,3,2);
  aa_v(&av,1,1);aa_v(&av,2,3);aa_sub(&av,3,&config);aa_v(&channel,1,4);aa_sub(&channel,3,&av);aa_sub(&response,1,&channel);
- channel.n=0;aa_var(&codes,4);aa_var(&codes,23);aa_var(&codes,65536);aa_sub(&input_pb,1,&codes);
+ channel.n=0;aa_input_advertise(&codes);aa_sub(&input_pb,1,&codes);
  aa_v(&channel,1,1);aa_sub(&channel,4,&input_pb);aa_sub(&response,1,&channel);
  const char *name="Wired Android Auto";aa_b(&response,2,(const uint8_t*)name,(unsigned)strlen(name));
- printf("AA_CAPABILITIES generation=%u video_channel=3 resolution_enum=1 fps_enum=1 width=800 height=480 audio_channel=4 rate=48000 bits=16 channels=2 input_channel=1 keys=4,23,65536\n",aa_gen);
+ printf("AA_CAPABILITIES generation=%u video_channel=3 resolution_enum=1 fps_enum=1 width=800 height=480 audio_channel=4 rate=48000 bits=16 channels=2 input_channel=1 keys=%s\n",aa_gen,aa_input_keylist());
  return aa_send(0,6,response.b,response.n,1,0);
 }
 static int aa_str(unsigned kind,const uint8_t *p,unsigned n,uint64_t pts,unsigned id){
@@ -250,27 +248,12 @@ static int aa_controls(void){
  while(aa_video_pending_acks&&aa_video_write-aa_video_read<AA_VIDEO_HIGH){
   struct AaPb ack={0};aa_v(&ack,1,aa_av_session[3]);aa_v(&ack,2,1);if(!aa_send(3,0x8004,ack.b,ack.n,1,0))return 0;aa_video_pending_acks--;
  }
- while(aa_key_read!=aa_key_write){
-  unsigned read=aa_key_read;__sync_synchronize();struct AaKey key=aa_keys[read%64];
-  if(key.generation!=aa_gen||!aa_bound){printf("AA_INPUT_DISCARD generation=%u item_generation=%u\n",aa_gen,key.generation);aa_key_read=read+1;continue;}
-  struct AaPb event={0},list={0},message={0};aa_v(&event,1,key.key);
-  aa_v(&event,2,key.key==65536?(uint64_t)(int64_t)key.action:(unsigned)key.action);
-  if(key.key!=65536){aa_v(&event,3,0);aa_v(&event,4,0);}aa_sub(&list,1,&event);aa_v(&message,1,key.us);aa_sub(&message,key.key==65536?6:4,&list);
-  if(!aa_send(1,0x8001,message.b,message.n,1,0))return 0;
-  printf("AA_INPUT generation=%u key=%u action=%d timestamp_us=%llu\n",aa_gen,key.key,key.action,(unsigned long long)key.us);
-  __sync_synchronize();aa_key_read=read+1;
- }
+ if(!aa_input_pump())return 0;
  if(aa_focus_request!=aa_focus_sent&&(aa_open&8)){
   unsigned wanted=aa_focus_request;uint8_t response[]={8,(uint8_t)((wanted&1)?1:2),16,1};
   if(!aa_send(3,0x8008,response,sizeof(response),1,0))return 0;aa_focus_sent=wanted;
  }
  return 1;
-}
-
-static void aa_input(unsigned key,int action){
- unsigned code=key==13?65536:key==8?23:key==2?4:0;require(code!=0,"AA supported input");
- unsigned write=aa_key_write;if(write-aa_key_read>=64){aa_requested_disconnect=aa_gen;puts("AA_INPUT_ERROR bounded_queue_full=1 disconnect_requested=1");return;}
- aa_keys[write%64]=(struct AaKey){aa_gen,code,action,now()/1000};__sync_synchronize();aa_key_write=write+1;
 }
 
 #endif
