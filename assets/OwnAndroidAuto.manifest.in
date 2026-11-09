@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Installed-HU CSpecialAppsHelper ignores type/id and constructs its local
+     connector with id=0. Name/resources are unique and installed separately. -->
+<plugin>
+  <name>OwnAndroidAuto</name><type>App</type><file>/opt/app/cisu/.ownandroidauto-369c9726-v24/OwnAndroidAuto</file>
+  <config>
+    <autoStart>yes</autoStart>
+    <dependencies><pluginAppConnector>
+      <type>Etch</type><id>0</id><asyncCallbacks>yes</asyncCallbacks>
+    </pluginAppConnector></dependencies>
+    <parameters>
+      <DescFile>{pluginDir}/OwnAndroidAuto.xml</DescFile>
+      <TextDBFile>{pluginDir}/OwnAndroidAuto_Texts.zip</TextDBFile>
+      <ImageDBFile>{pluginDir}/OwnAndroidAuto_Images.zip</ImageDBFile>
+    </parameters>
+  </config>
+</plugin>

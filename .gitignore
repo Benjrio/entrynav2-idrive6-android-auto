@@ -1,0 +1,20 @@
+/build/
+__pycache__/
+.DS_Store
+
+# Local SDK, firmware and reference identity: provide separately (PRIVATE_INPUTS_RU.md).
+/vendor/
+/runtime/aa/scene/
+/runtime/aa/identity/
+/assets/OwnAndroidAuto_Images.zip
+/third-party/work/
+
+# Export bookkeeping and historical research records (not build inputs).
+/manifest.json
+/verify.py
+/assets/icon-provenance.json
+/assets/identity-provenance.json
+/assets/profile.json
+/third-party/commands.json
+/third-party/README.md
+/src/aa-bytepipe.h

@@ -1,0 +1,26 @@
+<?xml version='1.0' encoding='utf-8'?>
+<pluginApps>
+  <pluginApp applicationType="Multimedia" applicationWeight="200" text="Android Auto">
+    <entryButton action="2" id="1" model="3" imageModel="4"><properties /></entryButton>
+    <actions>
+      <hmiAction id="2" target="10" />
+    </actions>
+    <events><focusEvent id="80" target="10" /></events>
+    <models>
+      <textIdModel id="3" textId="1"><synonyms /></textIdModel>
+      <imageIdModel id="4" imageId="1" />
+      <raIntModel id="14" /><raIntModel id="15" />
+    </models>
+    <hmiStates>
+      <hmiState id="10" text="Android Auto" textModel="3">
+        <components>
+          <surfaceComponent id="71" layerIdModel="14" surfaceIdModel="15"><properties>
+            <property id="2" value="false" /><property id="3" value="true" />
+            <property id="9" value="1280" /><property id="10" value="480" />
+            <property id="20" value="0" /><property id="21" value="0" />
+          </properties></surfaceComponent>
+          </components>
+      </hmiState>
+    </hmiStates>
+  </pluginApp>
+</pluginApps>

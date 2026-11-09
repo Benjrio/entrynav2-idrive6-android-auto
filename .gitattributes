@@ -1,0 +1,13 @@
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.so* -text
+*.elf -text
+*.bin -text
+*.zip -text
+*.gz -text
+*.xz -text
+*.key -text
+*.crt -text
+/vendor/** -text
+/runtime/** -text
