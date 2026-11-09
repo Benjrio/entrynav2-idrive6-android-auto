@@ -16,6 +16,33 @@ ctl=$work/ownandroidauto-control.elf
 chmod 700 "$ctl"
 
 aa_files='hu-aa.elf usb-device.conf lib/libavcodec.so.61 lib/libavutil.so.59 lib/libssl.so.1.0.0 lib/libcrypto.so.1.0.0 identity/phone.crt identity/phone.key scene/winston scene/libwlxs-genivi.so'
+# In the kit only, never copied to the runtime cache.
+kit_only_files='usb-scan.elf vmost-listen.elf'
+
+if [ "$mode" = vmost-listen ]; then
+    # Passive: logs what the virtual MOST daemon delivers for FBlock shadows (default CF.00 and E5.00) for N seconds
+    # (default 20). Registers shadows only and sends no MOST message. Operate the iDrive controller meanwhile.
+    # Usage: run-hu.sh vmost-listen <kit> [seconds] [FB.II ...]
+    seconds=${3:-20}
+    case "$seconds" in [1-9]|[1-9][0-9]|[1-5][0-9][0-9]|600) ;; *) exit 64 ;; esac
+    if [ $# -ge 3 ]; then shift 3; else shift $#; fi
+    [ $# -le 8 ] || exit 64
+    for s in "$@"; do case "$s" in [0-9A-Fa-f][0-9A-Fa-f].[0-9A-Fa-f][0-9A-Fa-f]) ;; *) exit 64 ;; esac; done
+    for f in aa aa/vmost-listen.elf; do [ -e "$work/$f" ] && [ ! -L "$work/$f" ] || exit 65; done
+    chmod 700 "$work/aa/vmost-listen.elf"
+    exec "$work/aa/vmost-listen.elf" -s "$seconds" "$@"
+fi
+
+if [ "$mode" = usb-scan ]; then
+    # Read-only: which USB device hu-aa.elf would pick with this kit's usb-device.conf. Reads sysfs only; sends
+    # nothing to any USB device. Optional third argument: watch for N seconds (plug/unplug meanwhile).
+    watch=${3:-}
+    case "$watch" in ''|[1-9]|[1-9][0-9]|[1-5][0-9][0-9]|600) ;; *) exit 64 ;; esac
+    for f in aa aa/usb-scan.elf aa/usb-device.conf; do [ -e "$work/$f" ] && [ ! -L "$work/$f" ] || exit 65; done
+    chmod 700 "$work/aa/usb-scan.elf"
+    cd "$work/aa"
+    if [ -n "$watch" ]; then exec ./usb-scan.elf -w "$watch"; else exec ./usb-scan.elf; fi
+fi
 
 aa_validate() {
     for d in "$1/aa" "$1/aa/lib" "$1/aa/identity" "$1/aa/scene"; do
@@ -29,8 +56,8 @@ aa_remove() {
         [ ! -L "$d" ] || return 1
         [ ! -e "$d" ] || [ -d "$d" ] || return 1
     done
-    for f in $aa_files; do [ ! -L "$1/aa/$f" ] || return 1; done
-    for f in $aa_files; do if [ -f "$1/aa/$f" ]; then rm "$1/aa/$f"; fi; done
+    for f in $aa_files $kit_only_files; do [ ! -L "$1/aa/$f" ] || return 1; done
+    for f in $aa_files $kit_only_files; do if [ -f "$1/aa/$f" ]; then rm "$1/aa/$f"; fi; done
     for d in "$1/aa/lib" "$1/aa/identity" "$1/aa/scene" "$1/aa"; do
         if [ -d "$d" ]; then rmdir "$d" || return 1; fi
     done
