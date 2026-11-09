@@ -27,7 +27,7 @@ static int usb_failure(const char *stage,int rc,int error,const char *detail){
 }
 static int usb_invalid(const char *field){return usb_failure("descriptor-validation",0,EPROTO,field);}
 static unsigned read_number(const char *port,const char *field,unsigned base){
- char path[256],text[40];snprintf(path,sizeof(path),"/sys/bus/usb/devices/%s/%s",port,field);
+ char path[256],text[40];snprintf(path,sizeof(path),"%s/%s/%s",usb_sysfs_root,port,field);
  FILE *f=fopen(path,"r");if(!f)return 0;int ok=fgets(text,sizeof(text),f)!=NULL;fclose(f);return ok?(unsigned)strtoul(text,NULL,base):0;
 }
 /* Preserve the initiating error across bounded best-effort owner observations. */
@@ -77,13 +77,17 @@ static void usb_close(void){
  usb_fd=usb_claimed=-1;
  printf("USB_CLEANUP source=%s claimed_before=%d release_attempted=%d release_rc=%d release_errno=%d released=%d closed=1 threads=0 rx=%lu tx=%lu\n",USB_EVENT_SOURCE,was,was,rc,error,!was||rc==0||error==ENODEV,usb_rx,usb_tx);errno=saved;
 }
-static int accessory(unsigned v,unsigned p){return v==0x18d1&&(p==0x2d00||p==0x2d01);}
+static int accessory(unsigned v,unsigned p){return usb_aoa_ids(v,p);}
+/* Enumeration picked by the port/any policies (usb_select_discovered); open must find exactly that device. */
+static unsigned usb_sel_vid,usb_sel_pid,usb_sel_dev;static int usb_sel_valid;
 static int usb_open_port(int reenum){
  if(cancelled)return usb_failure("open",-1,ECANCELED,"cancel-before-open");
  unsigned vid=read_number(usb_port,"idVendor",16),pid=read_number(usb_port,"idProduct",16);
- if(reenum?!accessory(vid,pid):!(usb_phone_matches(vid,pid)||accessory(vid,pid)))return usb_failure("device-selection",-1,ENODEV,"identity-mismatch-or-absent");
- if(read_number(usb_port,"bDeviceClass",16)==9)return usb_failure("device-selection",-1,EPERM,"hub-rejected");
  unsigned bus=read_number(usb_port,"busnum",10),dev=read_number(usb_port,"devnum",10);
+ int identity=reenum?accessory(vid,pid):accessory(vid,pid)||
+  (usb_policy_discovers()?usb_sel_valid&&vid==usb_sel_vid&&pid==usb_sel_pid&&dev==usb_sel_dev:usb_phone_matches(vid,pid));
+ if(!identity)return usb_failure("device-selection",-1,ENODEV,"identity-mismatch-or-absent");
+ if(read_number(usb_port,"bDeviceClass",16)==9)return usb_failure("device-selection",-1,EPERM,"hub-rejected");
  if(!bus||!dev||(reenum&&(bus!=usb_bus||dev==usb_dev)))return usb_failure("enumeration",-1,ENODEV,"bus-or-fresh-devnum");
  snprintf(usb_node,sizeof(usb_node),"/dev/bus/usb/%03u/%03u",bus,dev);
  usb_fd=open(usb_node,O_RDWR|O_CLOEXEC);int error=usb_fd<0?errno:0;
@@ -99,8 +103,25 @@ static int usb_open_port(int reenum){
  usb_bus=bus;usb_dev=dev;printf("USB_DEVICE source=%s port=%s bus=%u dev=%u vid=%04x pid=%04x opened_descriptor_verified=1\n",USB_EVENT_SOURCE,usb_port,bus,dev,vid,pid);return accessory(vid,pid)?2:1;
 fail:usb_close();return 0;
 }
+/* port/any policies: sysfs-only filter (usb_discovery.h). Nothing is sent to any device here; with two or more
+ * candidates nothing is sent at all. only_port limits the pass to one port (reconnect, --port). */
+static int usb_select_discovered(const char *only_port){
+ static struct usb_cand list[USB_DISC_MAX];unsigned picked=0,settling=0,n;uint64_t t=now();const struct usb_cand *one=NULL;
+ usb_sel_valid=0;
+ if(only_port){n=1;if(usb_disc_eval(only_port,&list[0],t))picked=1;else if(list[0].settling)settling=1;}
+ else n=usb_disc_scan(list,USB_DISC_MAX,t,&picked,&settling);
+ for(unsigned i=0;i<n;i++){usb_disc_log(USB_EVENT_SOURCE,&list[i]);if(list[i].eligible||list[i].accessory)one=&list[i];}
+ printf("USB_SELECTION source=%s policy=%s candidates=%u settling=%u ambiguity_write_attempted=0\n",USB_EVENT_SOURCE,usb_policy_name(),picked,settling);
+ if(picked>1)return usb_failure("device-selection",0,EBUSY,"ambiguous");
+ if(!picked)return usb_failure("device-selection",0,ENODEV,settling?"settling":"no-device");
+ strcpy(usb_port,one->port);usb_sel_vid=one->vid;usb_sel_pid=one->pid;usb_sel_dev=one->dev;usb_sel_valid=1;
+ return 1;
+}
 static int usb_select(const char *explicit_port){
- if(explicit_port&&*explicit_port){if(strlen(explicit_port)>=sizeof(usb_port)||strspn(explicit_port,"0123456789-.")!=strlen(explicit_port))return usb_failure("device-selection",0,EINVAL,"invalid-port");if(explicit_port!=usb_port)strcpy(usb_port,explicit_port);return 1;}
+ if(explicit_port&&*explicit_port){if(strlen(explicit_port)>=sizeof(usb_port)||strspn(explicit_port,"0123456789-.")!=strlen(explicit_port))return usb_failure("device-selection",0,EINVAL,"invalid-port");
+  if(usb_policy_discovers()){char only[sizeof(usb_port)];strcpy(only,explicit_port);return usb_select_discovered(only);}
+  if(explicit_port!=usb_port)strcpy(usb_port,explicit_port);return 1;}
+ if(usb_policy_discovers())return usb_select_discovered(NULL);
  DIR *dir=opendir("/sys/bus/usb/devices");if(!dir)return usb_failure("device-selection",-1,errno,"sysfs-open");struct dirent *e;unsigned count=0;
  while((e=readdir(dir))){if(strchr(e->d_name,':')||strlen(e->d_name)>=sizeof(usb_port))continue;
   unsigned v=read_number(e->d_name,"idVendor",16),p=read_number(e->d_name,"idProduct",16);
@@ -161,7 +182,13 @@ static int usb_connect(const char *port){
  if(!usb_select(port))return 0;int mode=usb_open_port(0);if(!mode)return 0;
  if(mode==1){if(usb_aoa_attempts>=3){usb_failure("AOA-attempt-budget",0,ETIMEDOUT,"max-3");goto fail;}usb_aoa_attempts++;printf("USB_AOA_ATTEMPT source=%s index=%u max=3\n",USB_EVENT_SOURCE,usb_aoa_attempts);
   unsigned char version[2]={0};int n=usb_ctl(0xc0,51,0,version,2),error=n<0?errno:0;unsigned protocol=version[0]|version[1]<<8;
-  if(n!=2||(protocol!=1&&protocol!=2)){usb_failure("AOA_GET_PROTOCOL",n,n<0?error:EPROTO,"length-or-version");goto fail;}
+  const char *probe=n<0?(error==EPIPE?"stall":"error"):n!=2?"short":(protocol!=1&&protocol!=2)?"version":"ok";
+  printf("USB_AOA_PROBE source=%s port=%s bus=%u dev=%u vid=%04x pid=%04x result=%s version=%u\n",USB_EVENT_SOURCE,usb_port,usb_bus,usb_dev,
+   read_number(usb_port,"idVendor",16),read_number(usb_port,"idProduct",16),probe,protocol);
+  if(n!=2||(protocol!=1&&protocol!=2)){
+   /* Never ask this enumeration again; a replug (new devnum) clears it. */
+   if(usb_policy_discovers())usb_disc_mark_not_aoa(usb_port,usb_bus,usb_dev);
+   usb_failure("AOA_GET_PROTOCOL",n,n<0?error:EPROTO,"length-or-version");goto fail;}
   printf("USB_AOA source=%s version=%u\n",USB_EVENT_SOURCE,protocol);
   const char *strings[]={"Android","Android Auto","Android Auto","2.0.1","https://example.invalid/entrynav2","WIRED-AA-001"};
   for(unsigned i=0;i<6;i++){n=usb_ctl(0x40,52,i,(void*)strings[i],strlen(strings[i])+1);error=n<0?errno:0;if(n!=(int)strlen(strings[i])+1){printf("USB_AOA_STRING index=%u\n",i);usb_failure("AOA_SEND_STRING",n,n<0?error:EPROTO,"short-or-failed");goto fail;}}

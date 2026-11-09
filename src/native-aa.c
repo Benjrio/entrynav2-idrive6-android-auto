@@ -39,6 +39,7 @@ static uint32_t local_control[16];
 #define PCM_FRAMES 480u
 #define PCM_RATE 48000u
 #include "usb_selection.h"
+#include "usb_discovery.h"
 #include "usb-native.h"
 #include "frame_output.h"
 static void video_end(void){
@@ -90,9 +91,9 @@ static void summary(unsigned connects,const char *reason){
  printf("STAGE_COUNTS version=%u TLS=%u services=%u video_RX=%u decode=%u present=%u\n",version_passes,tls_passes,service_passes,video_rx,decoded_count,present_count);
  char path[512];snprintf(path,sizeof(path),"%s/summary.json",out_dir);FILE*f=fopen(path,"w");if(!f)return;
  fprintf(f,"{\n  \"transport\": \"%s\",\n",transport_name());
- fprintf(f,"  \"schema\": 1, \"physical_acceptance\": false, \"physical_pixels_verified\": false,\n  \"connections\": %u, \"video_rx\": %u, \"decoded\": %u, \"present_submitted\": %u,\n  \"video_epochs\": %u, \"keepalive_requests\": %u, \"keepalive_responses\": %u,\n  \"audio_packets\": %u, \"audio_bytes\": %llu, \"audio_output\": \"UNVERIFIED_ROUTE_NOT_OPENED\",\n  \"idrive\": \"UNVERIFIED_NATIVE_INPUT_BACKEND\", \"microphone\": \"SKIP_NO_CAPTURE_BACKEND_OR_CONSENT\",\n  \"graphics_cleanup\": \"%s\", \"end_reason\": \"%s\"\n}\n",connects,video_rx,decoded_count,present_count,video_epoch,ping_requests,ping_responses,audio_packets,(unsigned long long)audio_bytes,graphics_blocked?"UNCONFIRMED":"OWN_REMOVED",reason);fclose(f);
+ fprintf(f,"  \"schema\": 1, \"physical_acceptance\": false, \"physical_pixels_verified\": false,\n  \"connections\": %u, \"video_rx\": %u, \"decoded\": %u, \"present_submitted\": %u,\n  \"video_epochs\": %u, \"keepalive_requests\": %u, \"keepalive_responses\": %u,\n  \"audio_packets\": %u, \"audio_bytes\": %llu, \"audio_output\": \"UNVERIFIED_ROUTE_NOT_OPENED\",\n  \"idrive\": \"UNVERIFIED_NATIVE_INPUT_BACKEND\", \"input_keys_sent\": %u, \"input_rotary_reports\": %u, \"input_long_presses\": %u, \"input_releases\": %u, \"input_dropped\": %u, \"microphone\": \"SKIP_NO_CAPTURE_BACKEND_OR_CONSENT\",\n  \"graphics_cleanup\": \"%s\", \"end_reason\": \"%s\"\n}\n",connects,video_rx,decoded_count,present_count,video_epoch,ping_requests,ping_responses,audio_packets,(unsigned long long)audio_bytes,aa_in_keys_sent,aa_in_rotary_sent,aa_in_longpress_sent,aa_in_released,aa_in_dropped,graphics_blocked?"UNCONFIRMED":"OWN_REMOVED",reason);fclose(f);
  snprintf(path,sizeof(path),"%s/usb-transport.json",out_dir);f=fopen(path,"w");if(!f)return;
- fprintf(f,"{\"source\":\"%s\",\"last_stage\":\"%s\",\"last_reason\":\"%s\",\"last_detail\":\"%s\",\"rc\":%d,\"errno\":%d,\"port\":\"%s\",\"bus\":%u,\"devnum\":%u,\"in\":%u,\"out\":%u,\"read_poll_timeouts\":%u,\"physical_acceptance\":false}\n","physical-usb",usb_last_stage,usb_last_reason,usb_last_detail,usb_last_rc,usb_last_errno,usb_port,usb_bus,usb_dev,usb_in,usb_out,usb_read_timeouts);fclose(f);
+ fprintf(f,"{\"source\":\"%s\",\"policy\":\"%s\",\"last_stage\":\"%s\",\"last_reason\":\"%s\",\"last_detail\":\"%s\",\"rc\":%d,\"errno\":%d,\"port\":\"%s\",\"bus\":%u,\"devnum\":%u,\"in\":%u,\"out\":%u,\"read_poll_timeouts\":%u,\"aoa_attempts\":%u,\"physical_acceptance\":false}\n","physical-usb",usb_policy_name(),usb_last_stage,usb_last_reason,usb_last_detail,usb_last_rc,usb_last_errno,usb_port,usb_bus,usb_dev,usb_in,usb_out,usb_read_timeouts,usb_aoa_attempts);fclose(f);
 }
 int main(int argc,char **argv){
  const char *port=NULL;unsigned total_seconds=1200,max_attempts=2;int preflight=0;
@@ -113,8 +114,10 @@ int main(int argc,char **argv){
   else if(!strcmp(argv[i],"--preflight"))preflight=1;
   else return 64;
  }
- if(!usb_phone_config()){puts("USB_CONFIG_ERROR expected_auto_or_port_vid_pid=1");return 64;}
+ if(!usb_phone_config()){puts("USB_CONFIG_ERROR expected_one_of=port_vid_pid,auto,port,any");return 64;}
  if(*usb_configured_port){if(port&&strcmp(port,usb_configured_port))return 64;port=usb_configured_port;}
+ else if(port&&usb_policy==USB_POLICY_PORTS&&!usb_policy_has_port(port))return 64;
+ printf("USB_POLICY mode=%s ports=%u\n",usb_policy_name(),usb_policy_nports);
  setbuf(stdout,NULL);signal(SIGINT,stop);signal(SIGTERM,stop);signal(SIGHUP,stop);signal(SIGPIPE,SIG_IGN);mkdir(out_dir,0700);
  printf("AA_HU_BEGIN abi=ARMv7-hardfloat glibc=%s AA_TLS_decode_on_HU=1 transport=%s\n",gnu_get_libc_version(),transport_name());
  printf("AUDIO_CHECK route=unverified pcm_not_opened=1 output=disabled\nIDRIVE_CHECK native_backend=unverified no_blind_input_grab=1\nMIC_CHECK capture=disabled\n");
@@ -140,7 +143,10 @@ int main(int argc,char **argv){
    /* Give the owner time to insert a cable. Do not retry busy/ambiguous
     * interfaces or repeatedly send AOA requests after negotiation failure. */
    if(connected)break;
-   if(!attempt&&(strcmp(usb_last_stage,"device-selection")||usb_last_errno!=ENODEV))break;
+   /* port/any: a device that refused AOA is remembered (never asked again) and the scan goes on, within the
+    * per-process GET_PROTOCOL budget; another phone may still be plugged in during the window. */
+   int keep_scanning=usb_policy_discovers()&&!strcmp(usb_last_stage,"AOA_GET_PROTOCOL")&&usb_aoa_attempts<3;
+   if(!attempt&&!keep_scanning&&(strcmp(usb_last_stage,"device-selection")||usb_last_errno!=ENODEV))break;
    usleep(500000);
   }while(!cancelled&&now()<wait_end&&now()<end);
   if(!connected){
@@ -164,7 +170,7 @@ int main(int argc,char **argv){
    if(!first_frame&&t-started>35000000000ULL){aa_error("video-start-deadline");break;}
    graphics_pump();
   }
-  if(!cancelled&&!aa_reason[0]&&aa_state==4){aa_focus_request=(aa_focus_request|1u)+1u;aa_controls();}
+  if(!cancelled&&!aa_reason[0]&&aa_state==4){aa_input_release_all("session-end");aa_focus_request=(aa_focus_request|1u)+1u;aa_controls();}
   if(aa_reason[0]){printf("AA_SESSION_END generation=%u reason=%s\n",aa_gen,aa_reason);snprintf(end_detail,sizeof(end_detail),"%s",aa_reason);end_reason=end_detail;}else puts("AA_SESSION_END reason=session-complete");
   graphics_hide(1);video_end();if(aa_ssl)SSL_free(aa_ssl);aa_ssl=NULL;aa_state=0;
   usb_close();
